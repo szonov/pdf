@@ -1,3 +1,3 @@
-module github.com/ledongthuc/pdf
+module github.com/szonov/pdf
 
 go 1.24.1

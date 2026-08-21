@@ -1,138 +1,118 @@
 # PDF Reader
 
-[![Built with WeBuild](https://raw.githubusercontent.com/webuild-community/badge/master/svg/WeBuild.svg)](https://webuild.community)
+`github.com/szonov/pdf` is a fork of
+[`github.com/ledongthuc/pdf`](https://github.com/ledongthuc/pdf), which in turn
+is based on [`rsc.io/pdf`](https://github.com/rsc/pdf).
 
-A simple Go library which enables reading PDF files. Forked from https://github.com/rsc/pdf
+The package reads PDF files and extracts plain or positioned text. This fork
+also provides:
 
-Features
-  - Get plain text content (without format)
-  - Get Content (including all font and formatting information)
+- O(N) sequential page-tree traversal without repeatedly looking pages up by
+  number;
+- early termination while walking pages or text blocks;
+- incremental extraction of positioned text blocks;
+- axis-aligned text bounds calculated from character codes, font metrics, text
+  state, and the current transformation matrix.
 
-## Install:
+## Installation
 
-`go get -u github.com/ledongthuc/pdf`
-
-## Examples:
-
- - Check in examples/ folder
-
-
-## Read plain text
-
-```golang
-package main
-
-import (
-	"bytes"
-	"fmt"
-
-	"github.com/ledongthuc/pdf"
-)
-
-func main() {
-	pdf.DebugOn = true
-
-	f, r, err := pdf.Open("./pdf_test.pdf")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	var buf bytes.Buffer
-	b, err := r.GetPlainText()
-	if err != nil {
-		panic(err)
-	}
-	buf.ReadFrom(b)
-	content := buf.String()
-	fmt.Println(content)
-}
+```sh
+go get github.com/szonov/pdf
 ```
 
-## Read all text with styles from PDF
+The module requires Go 1.24.1 or newer.
 
-```golang
+## Reading plain text
+
+```go
 package main
 
 import (
 	"fmt"
+	"io"
+	"log"
 
-	"github.com/ledongthuc/pdf"
+	"github.com/szonov/pdf"
 )
 
 func main() {
-	f, r, err := pdf.Open("./pdf_test.pdf")
+	file, reader, err := pdf.Open("document.pdf")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	defer f.Close()
+	defer file.Close()
 
-	sentences, err := r.GetStyledTexts()
+	text, err := reader.GetPlainText()
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
-	// Print all sentences
-	for _, sentence := range sentences {
-		fmt.Printf("Font: %s, Font-size: %f, x: %f, y: %f, content: %s \n",
-			sentence.Font,
-			sentence.FontSize,
-			sentence.X,
-			sentence.Y,
-			sentence.S)
+	contents, err := io.ReadAll(text)
+	if err != nil {
+		log.Fatal(err)
 	}
+	fmt.Print(string(contents))
 }
 ```
 
+## Walking pages
 
-## Read text grouped by rows
+`Reader.WalkPages` visits pages in document order. Page numbers start at 1.
+Returning an error from the callback stops the traversal and returns that
+error. Use `pdf.ErrStopWalking` when early termination is expected.
 
-```golang
-package main
-
-import (
-	"fmt"
-	"os"
-
-	"github.com/ledongthuc/pdf"
-)
-
-func main() {
-	content, err := readPdf(os.Args[1]) // Read local pdf file
-	if err != nil {
-		panic(err)
+```go
+err := reader.WalkPages(func(number int, page pdf.Page) error {
+	fmt.Printf("page %d\n", number)
+	if number == 10 {
+		return pdf.ErrStopWalking
 	}
-	fmt.Println(content)
-	return
-}
-
-func readPdf(path string) (string, error) {
-	f, r, err := pdf.Open(path)
-	defer func() {
-		_ = f.Close()
-	}()
-	if err != nil {
-		return "", err
-	}
-	totalPage := r.NumPage()
-
-	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
-		p := r.Page(pageIndex)
-		if p.V.IsNull() || p.V.Key("Contents").Kind() == pdf.Null {
-			continue
-		}
-
-		rows, _ := p.GetTextByRow()
-		for _, row := range rows {
-		    println(">>>> row: ", row.Position)
-		    for _, word := range row.Content {
-		        fmt.Println(word.S)
-		    }
-		}
-	}
-	return "", nil
+	return nil
+})
+if err != nil && !errors.Is(err, pdf.ErrStopWalking) {
+	log.Fatal(err)
 }
 ```
 
-## Demo
-![Run example](https://i.gyazo.com/01fbc539e9872593e0ff6bac7e954e6d.gif)
+Unlike repeatedly calling `Reader.Page`, this method traverses the PDF page
+tree once and can stop before later pages are resolved.
+
+## Walking positioned text
+
+`Page.WalkTextBlocks` interprets a page's content streams in order and emits
+positioned blocks incrementally. Adjacent fragments with the same font and
+baseline may be combined into one block.
+
+Coordinates and dimensions are expressed in page-space points. `X` and `Y`
+identify the lower-left corner of the axis-aligned bounds. `BaselineX` and
+`BaselineY` identify the transformed text origin after text rise is applied.
+
+```go
+err := page.WalkTextBlocks(func(block pdf.TextBlock) error {
+	fmt.Printf(
+		"%q font=%s size=%.1f bounds=(%.1f, %.1f, %.1f, %.1f)\n",
+		block.Text,
+		block.Font,
+		block.FontSize,
+		block.X,
+		block.Y,
+		block.Width,
+		block.Height,
+	)
+	return nil
+})
+if err != nil && !errors.Is(err, pdf.ErrStopTextBlocks) {
+	log.Fatal(err)
+}
+```
+
+Return `pdf.ErrStopTextBlocks` from the callback to stop interpreting the rest
+of the page. Other callback and parsing errors are returned unchanged.
+
+The original APIs for styled text, rows, columns, and page content remain
+available. Runnable examples are in [`examples`](examples).
+
+## License
+
+This project is distributed under the BSD 3-Clause License. See
+[`LICENSE`](LICENSE).
