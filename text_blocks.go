@@ -11,6 +11,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -202,12 +203,16 @@ func walkTextBlockContent(
 			cached, ok := fonts[fontName]
 			if !ok {
 				font := Font{V: resources.Key("Font").Key(fontName)}
-				cached = textBlockFont{font: font, encoding: font.Encoder(), widths: make(map[string]float64)}
+				cached = textBlockFont{
+					font: font, encoding: cachedFontEncoding(font.V), widths: cachedFontWidths(font.V),
+					geometry: cachedTextBlockFontGeometry(font),
+				}
 				fonts[fontName] = cached
 			}
 			g.font = cached.font
 			g.encoding = cached.encoding
 			g.widths = cached.widths
+			g.fontGeometry = cached.geometry
 			g.fontSize = args[1].Float64()
 		case "Tc":
 			if len(args) != 1 {
@@ -399,7 +404,8 @@ type textBlockState struct {
 	font            Font
 	fontSize        float64
 	encoding        TextEncoding
-	widths          map[string]float64
+	widths          *textWidthCache
+	fontGeometry    textBlockFontGeometry
 	textMatrix      matrix
 	lineMatrix      matrix
 	ctm             matrix
@@ -408,7 +414,8 @@ type textBlockState struct {
 type textBlockFont struct {
 	font     Font
 	encoding TextEncoding
-	widths   map[string]float64
+	widths   *textWidthCache
+	geometry textBlockFontGeometry
 }
 
 func (g *textBlockState) moveLine(tx, ty float64) {
@@ -428,7 +435,7 @@ func (g *textBlockState) showStrings(parts []Value, executor func(TextBlock) err
 		}
 		value := text.String()
 		if strings.TrimSpace(value) != "" {
-			block := makeTextBlock(value, g.font, g.fontSize, g.rise, advance, start, g.ctm)
+			block := makeTextBlock(value, g.fontGeometry, g.fontSize, g.rise, advance, start, g.ctm)
 			block.leadingSpace = startsWithWhitespace(value)
 			block.trailingSpace = endsWithWhitespace(value)
 			block.Text = strings.TrimSpace(value)
@@ -474,11 +481,7 @@ func (g *textBlockState) showStrings(parts []Value, executor func(TextBlock) err
 				start = g.textMatrix
 			}
 			text.WriteString(decoded)
-			width, ok := g.widths[code]
-			if !ok {
-				width = fontCodeWidth(g.font, code)
-				g.widths[code] = width
-			}
+			width := g.widths.width(g.font, code)
 			word := 0.0
 			if len(code) == 1 && code[0] == 0x20 {
 				word = g.wordSpacing
@@ -492,12 +495,48 @@ func (g *textBlockState) showStrings(parts []Value, executor func(TextBlock) err
 	return flush()
 }
 
+type textWidthCache struct {
+	mu     sync.RWMutex
+	values map[string]float64
+}
+
+func cachedFontWidths(value Value) *textWidthCache {
+	if value.r == nil || value.ptr.id == 0 {
+		return &textWidthCache{values: make(map[string]float64)}
+	}
+	value.r.fontMu.Lock()
+	defer value.r.fontMu.Unlock()
+	if widths, found := value.r.fontWidths[value.ptr]; found {
+		return widths
+	}
+	widths := &textWidthCache{values: make(map[string]float64)}
+	value.r.fontWidths[value.ptr] = widths
+	return widths
+}
+
+func (c *textWidthCache) width(font Font, code string) float64 {
+	c.mu.RLock()
+	width, found := c.values[code]
+	c.mu.RUnlock()
+	if found {
+		return width
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if width, found = c.values[code]; found {
+		return width
+	}
+	width = fontCodeWidth(font, code)
+	c.values[code] = width
+	return width
+}
+
 func (g *textBlockState) advance(tx float64) {
 	g.textMatrix = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.textMatrix)
 }
 
-func makeTextBlock(text string, font Font, fontSize, rise, advance float64, tm, ctm matrix) TextBlock {
-	ascent, descent := fontVerticalMetrics(font)
+func makeTextBlock(text string, font textBlockFontGeometry, fontSize, rise, advance float64, tm, ctm matrix) TextBlock {
+	ascent, descent := font.ascent, font.descent
 	transform := tm.mul(ctm)
 	x0, y0 := transformTextPoint(transform, 0, descent/1000*fontSize+rise)
 	x1, y1 := transformTextPoint(transform, advance, descent/1000*fontSize+rise)
@@ -509,14 +548,46 @@ func makeTextBlock(text string, font Font, fontSize, rise, advance float64, tm, 
 	maxX := math.Max(math.Max(x0, x1), math.Max(x2, x3))
 	minY := math.Min(math.Min(y0, y1), math.Min(y2, y3))
 	maxY := math.Max(math.Max(y0, y1), math.Max(y2, y3))
+	return TextBlock{
+		Text: text, X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY,
+		BaselineX: baselineX, BaselineY: baselineY, Font: font.name, FontSize: effectiveFontSize,
+	}
+}
+
+type textBlockFontGeometry struct {
+	ascent  float64
+	descent float64
+	name    string
+}
+
+func cachedTextBlockFontGeometry(font Font) textBlockFontGeometry {
+	value := font.V
+	if value.r == nil || value.ptr.id == 0 {
+		return newTextBlockFontGeometry(font)
+	}
+	value.r.fontMu.RLock()
+	geometry, found := value.r.fontGeometry[value.ptr]
+	value.r.fontMu.RUnlock()
+	if found {
+		return geometry
+	}
+	value.r.fontMu.Lock()
+	defer value.r.fontMu.Unlock()
+	if geometry, found = value.r.fontGeometry[value.ptr]; found {
+		return geometry
+	}
+	geometry = newTextBlockFontGeometry(font)
+	value.r.fontGeometry[value.ptr] = geometry
+	return geometry
+}
+
+func newTextBlockFontGeometry(font Font) textBlockFontGeometry {
+	ascent, descent := fontVerticalMetrics(font)
 	name := font.BaseFont()
 	if i := strings.Index(name, "+"); i >= 0 {
 		name = name[i+1:]
 	}
-	return TextBlock{
-		Text: text, X: minX, Y: minY, Width: maxX - minX, Height: maxY - minY,
-		BaselineX: baselineX, BaselineY: baselineY, Font: name, FontSize: effectiveFontSize,
-	}
+	return textBlockFontGeometry{ascent: ascent, descent: descent, name: name}
 }
 
 func transformTextPoint(m matrix, x, y float64) (float64, float64) {

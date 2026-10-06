@@ -91,6 +91,8 @@ type Reader struct {
 	resourceCache map[objptr]object
 	fontMu        sync.RWMutex
 	fontEncodings map[objptr]TextEncoding
+	fontWidths    map[objptr]*textWidthCache
+	fontGeometry  map[objptr]textBlockFontGeometry
 }
 
 type xref struct {
@@ -167,6 +169,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		end:           end,
 		resourceCache: make(map[objptr]object),
 		fontEncodings: make(map[objptr]TextEncoding),
+		fontWidths:    make(map[objptr]*textWidthCache),
+		fontGeometry:  make(map[objptr]textBlockFontGeometry),
 	}
 	pos := end - endChunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
