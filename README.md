@@ -104,7 +104,7 @@ numeric positioning adjustments are skipped. Text inside Form XObjects is
 visited recursively. Return `pdf.ErrStopTexts` to stop immediately without
 interpreting the rest of the page.
 
-## Walking positioned text
+## Walking positioned text blocks
 
 `Page.WalkTextBlocks` interprets a page's content streams in order and emits
 positioned blocks incrementally. Adjacent fragments with the same font and
@@ -135,6 +135,10 @@ if err != nil && !errors.Is(err, pdf.ErrStopTextBlocks) {
 
 Return `pdf.ErrStopTextBlocks` from the callback to stop interpreting the rest
 of the page. Other callback and parsing errors are returned unchanged.
+
+Shared resource dictionaries, decoded font encodings, glyph widths, and font
+geometry are cached by the reader. This avoids recalculating the same font data
+for every page while keeping page content streams out of the cache.
 
 The original APIs for styled text, rows, columns, and page content remain
 available. Runnable examples are in [`examples`](examples).
