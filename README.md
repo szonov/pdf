@@ -77,6 +77,33 @@ if err != nil && !errors.Is(err, pdf.ErrStopWalking) {
 Unlike repeatedly calling `Reader.Page`, this method traverses the PDF page
 tree once and can stop before later pages are resolved.
 
+## Walking text
+
+`Page.WalkTexts` emits decoded strings from PDF text-showing operators in
+content-stream order. It does not calculate coordinates or font metrics and
+does not merge adjacent strings, so it is suitable for fast prefix searches
+and other cases where layout is not needed.
+
+```go
+texts := 0
+err := page.WalkTexts(func(text string) error {
+	fmt.Print(text)
+	texts++
+	if texts == 10 {
+		return pdf.ErrStopTexts
+	}
+	return nil
+})
+if err != nil && !errors.Is(err, pdf.ErrStopTexts) {
+	log.Fatal(err)
+}
+```
+
+For a `TJ` array, the callback is invoked separately for each string element;
+numeric positioning adjustments are skipped. Text inside Form XObjects is
+visited recursively. Return `pdf.ErrStopTexts` to stop immediately without
+interpreting the rest of the page.
+
 ## Walking positioned text
 
 `Page.WalkTextBlocks` interprets a page's content streams in order and emits
