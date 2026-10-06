@@ -9,11 +9,16 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ErrStopTextBlocks stops WalkTextBlocks without interpreting the rest of the page.
 var ErrStopTextBlocks = errors.New("stop walking text blocks")
+
+const maxFormXObjectDepth = 12
 
 // TextBlock contains extracted text and its axis-aligned page-space bounds.
 // Adjacent text-showing operations may be combined into one block.
@@ -32,6 +37,94 @@ type TextBlock struct {
 
 	Font     string
 	FontSize float64
+
+	leadingSpace  bool
+	trailingSpace bool
+}
+
+type positionedTextBlock struct {
+	block      TextBlock
+	line       float64
+	start, end float64
+}
+
+type positionedTextLine struct {
+	line, height float64
+	blocks       []positionedTextBlock
+}
+
+// layoutTextBlocks reconstructs readable lines from the geometry already
+// collected by WalkTextBlocks. It does not interpret the PDF a second time.
+func layoutTextBlocks(blocks []TextBlock, rotation int64) string {
+	positioned := make([]positionedTextBlock, 0, len(blocks))
+	rotation = ((rotation % 360) + 360) % 360
+	for _, block := range blocks {
+		block.Text = strings.TrimSpace(block.Text)
+		if block.Text == "" {
+			continue
+		}
+		item := positionedTextBlock{block: block}
+		switch rotation {
+		case 90:
+			item.line, item.start, item.end = block.BaselineX, -(block.Y + block.Height), -block.Y
+		case 180:
+			item.line, item.start, item.end = block.BaselineY, -(block.X + block.Width), -block.X
+		case 270:
+			item.line, item.start, item.end = -block.BaselineX, block.Y, block.Y+block.Height
+		default:
+			item.line, item.start, item.end = -block.BaselineY, block.X, block.X+block.Width
+		}
+		positioned = append(positioned, item)
+	}
+	sort.SliceStable(positioned, func(i, j int) bool {
+		if positioned[i].line != positioned[j].line {
+			return positioned[i].line < positioned[j].line
+		}
+		return positioned[i].start < positioned[j].start
+	})
+
+	lines := make([]positionedTextLine, 0, len(positioned))
+	for _, item := range positioned {
+		itemHeight := math.Max(math.Max(item.block.Height, item.block.FontSize), 1)
+		if len(lines) == 0 {
+			lines = append(lines, positionedTextLine{line: item.line, height: itemHeight, blocks: []positionedTextBlock{item}})
+			continue
+		}
+		current := &lines[len(lines)-1]
+		lineTolerance := math.Max(math.Max(current.height, itemHeight)*0.4, 1)
+		if math.Abs(item.line-current.line) > lineTolerance {
+			lines = append(lines, positionedTextLine{line: item.line, height: itemHeight, blocks: []positionedTextBlock{item}})
+			continue
+		}
+		current.blocks = append(current.blocks, item)
+		current.height = math.Max(current.height, itemHeight)
+	}
+
+	var result strings.Builder
+	for lineIndex, textLine := range lines {
+		sort.SliceStable(textLine.blocks, func(i, j int) bool {
+			return textLine.blocks[i].start < textLine.blocks[j].start
+		})
+		if lineIndex > 0 {
+			result.WriteByte('\n')
+		}
+		var end, height float64
+		previousTrailingSpace := false
+		for blockIndex, item := range textLine.blocks {
+			itemHeight := math.Max(math.Max(item.block.Height, item.block.FontSize), 1)
+			if blockIndex > 0 {
+				gap := item.start - end
+				if item.block.leadingSpace || previousTrailingSpace || gap > math.Max(math.Min(height, itemHeight)*0.15, 0.75) {
+					result.WriteByte(' ')
+				}
+			}
+			result.WriteString(item.block.Text)
+			end = math.Max(end, item.end)
+			height = math.Max(height, itemHeight)
+			previousTrailingSpace = item.block.trailingSpace
+		}
+	}
+	return result.String()
 }
 
 // WalkTextBlocks interprets positioned text on p and incrementally calls
@@ -53,21 +146,43 @@ func (p Page) WalkTextBlocks(executor func(TextBlock) error) (err error) {
 	}()
 
 	g := textBlockState{horizontalScale: 1, ctm: ident, textMatrix: ident, lineMatrix: ident}
-	var graphicsStack []textBlockState
 	blocks := textBlockCoalescer{executor: executor}
+	err = walkTextBlockContent(
+		p.V.Key("Contents"),
+		p.Resources(),
+		&g,
+		&blocks,
+		0,
+		make(map[objptr]bool),
+	)
+	if err != nil {
+		return err
+	}
+	return blocks.flush()
+}
+
+func walkTextBlockContent(
+	contents Value,
+	resources Value,
+	g *textBlockState,
+	blocks *textBlockCoalescer,
+	depth int,
+	activeForms map[objptr]bool,
+) error {
+	var graphicsStack []textBlockState
 	fonts := make(map[string]textBlockFont)
 
-	err = interpretTextUntil(p.V.Key("Contents"), func(stk *Stack, op string) error {
+	return interpretTextUntil(contents, func(stk *Stack, op string) error {
 		args := popTextArguments(stk)
 
 		switch op {
 		case "q":
-			graphicsStack = append(graphicsStack, g)
+			graphicsStack = append(graphicsStack, *g)
 		case "Q":
 			if len(graphicsStack) == 0 {
 				return errors.New("unmatched Q operator")
 			}
-			g = graphicsStack[len(graphicsStack)-1]
+			*g = graphicsStack[len(graphicsStack)-1]
 			graphicsStack = graphicsStack[:len(graphicsStack)-1]
 		case "cm":
 			m, err := textBlockMatrix(args, "cm")
@@ -86,7 +201,7 @@ func (p Page) WalkTextBlocks(executor func(TextBlock) error) (err error) {
 			fontName := args[0].Name()
 			cached, ok := fonts[fontName]
 			if !ok {
-				font := p.Font(fontName)
+				font := Font{V: resources.Key("Font").Key(fontName)}
 				cached = textBlockFont{font: font, encoding: font.Encoder(), widths: make(map[string]float64)}
 				fonts[fontName] = cached
 			}
@@ -163,13 +278,49 @@ func (p Page) WalkTextBlocks(executor func(TextBlock) error) (err error) {
 			g.charSpacing = args[1].Float64()
 			g.moveLine(0, -g.leading)
 			return g.showStrings([]Value{args[2]}, blocks.add)
+		case "Do":
+			if len(args) != 1 || args[0].Kind() != Name {
+				return fmt.Errorf("Do: want one name operand")
+			}
+			if depth >= maxFormXObjectDepth {
+				return fmt.Errorf("Form XObject nesting exceeds maximum depth %d", maxFormXObjectDepth)
+			}
+			form := resources.Key("XObject").Key(args[0].Name())
+			if form.Kind() != Stream || form.Key("Subtype").Name() != "Form" {
+				return nil
+			}
+			if form.ptr.id != 0 {
+				if activeForms[form.ptr] {
+					return fmt.Errorf("cyclic Form XObject reference %d %d", form.ptr.id, form.ptr.gen)
+				}
+				activeForms[form.ptr] = true
+				defer delete(activeForms, form.ptr)
+			}
+
+			outer := *g
+			defer func() { *g = outer }()
+			if formMatrix, ok := matrixFromValue(form.Key("Matrix")); ok {
+				g.ctm = formMatrix.mul(g.ctm)
+			}
+			formResources := form.Key("Resources")
+			if formResources.Kind() == Null {
+				formResources = resources
+			}
+			return walkTextBlockContent(form, formResources, g, blocks, depth+1, activeForms)
 		}
 		return nil
 	})
-	if err != nil {
-		return err
+}
+
+func matrixFromValue(value Value) (matrix, bool) {
+	if value.Kind() != Array || value.Len() != 6 {
+		return matrix{}, false
 	}
-	return blocks.flush()
+	m := ident
+	for i := 0; i < 6; i++ {
+		m[i/2][i%2] = value.Index(i).Float64()
+	}
+	return m, true
 }
 
 type textBlockCoalescer struct {
@@ -190,6 +341,7 @@ func (c *textBlockCoalescer) add(next TextBlock) error {
 		maxY := math.Max(c.pending.Y+c.pending.Height, next.Y+next.Height)
 		c.pending.X, c.pending.Y = minX, minY
 		c.pending.Width, c.pending.Height = maxX-minX, maxY-minY
+		c.pending.trailingSpace = next.trailingSpace
 		return nil
 	}
 	if err := c.flush(); err != nil {
@@ -212,12 +364,30 @@ func canMergeTextBlocks(left, right TextBlock) bool {
 	if left.Font != right.Font || math.Abs(left.FontSize-right.FontSize) > 0.01 {
 		return false
 	}
+	if left.trailingSpace || right.leadingSpace {
+		return false
+	}
 	tolerance := math.Max(left.FontSize, 1) * 0.15
 	if math.Abs(left.BaselineY-right.BaselineY) > tolerance {
 		return false
 	}
 	gap := right.X - (left.X + left.Width)
-	return gap >= -tolerance && gap <= math.Max(left.FontSize, 1)*1.25
+	return gap >= -tolerance && gap <= tolerance
+}
+
+func startsWithWhitespace(text string) bool {
+	for _, r := range text {
+		return unicode.IsSpace(r)
+	}
+	return false
+}
+
+func endsWithWhitespace(text string) bool {
+	for i := len(text); i > 0; {
+		r, size := utf8.DecodeLastRuneInString(text[:i])
+		return unicode.IsSpace(r) || size == 0
+	}
+	return false
 }
 
 type textBlockState struct {
@@ -251,23 +421,59 @@ func (g *textBlockState) showStrings(parts []Value, executor func(TextBlock) err
 	start := g.textMatrix
 	var text strings.Builder
 	advance := 0.0
+	previousWasWhitespace := false
+	flush := func() error {
+		if text.Len() == 0 {
+			return nil
+		}
+		value := text.String()
+		if strings.TrimSpace(value) != "" {
+			block := makeTextBlock(value, g.font, g.fontSize, g.rise, advance, start, g.ctm)
+			block.leadingSpace = startsWithWhitespace(value)
+			block.trailingSpace = endsWithWhitespace(value)
+			block.Text = strings.TrimSpace(value)
+			if err := executor(block); err != nil {
+				return err
+			}
+		}
+		text.Reset()
+		advance = 0
+		return nil
+	}
 
 	for _, part := range parts {
 		if part.Kind() != String {
 			adjustment := -part.Float64() / 1000 * g.fontSize * g.horizontalScale
+			wordGap := math.Max(math.Abs(g.fontSize*g.horizontalScale)*0.15, 0.75)
+			if text.Len() > 0 && adjustment > wordGap {
+				if err := flush(); err != nil {
+					return err
+				}
+				start = g.textMatrix
+			}
 			advance += adjustment
 			g.advance(adjustment)
+			if text.Len() == 0 {
+				start = g.textMatrix
+				advance = 0
+			}
 			continue
 		}
 
 		raw := part.RawString()
-		if g.encoding != nil {
-			text.WriteString(g.encoding.Decode(raw))
-		} else {
-			text.WriteString(raw)
-		}
-
 		for _, code := range splitTextCodes(raw, g.encoding) {
+			decoded := code
+			if g.encoding != nil {
+				decoded = g.encoding.Decode(code)
+			}
+			isWhitespace := strings.TrimSpace(decoded) == ""
+			if text.Len() > 0 && previousWasWhitespace && !isWhitespace {
+				if err := flush(); err != nil {
+					return err
+				}
+				start = g.textMatrix
+			}
+			text.WriteString(decoded)
 			width, ok := g.widths[code]
 			if !ok {
 				width = fontCodeWidth(g.font, code)
@@ -280,14 +486,10 @@ func (g *textBlockState) showStrings(parts []Value, executor func(TextBlock) err
 			delta := (width/1000*g.fontSize + g.charSpacing + word) * g.horizontalScale
 			advance += delta
 			g.advance(delta)
+			previousWasWhitespace = isWhitespace
 		}
 	}
-
-	if text.Len() == 0 {
-		return nil
-	}
-	block := makeTextBlock(text.String(), g.font, g.fontSize, g.rise, advance, start, g.ctm)
-	return executor(block)
+	return flush()
 }
 
 func (g *textBlockState) advance(tx float64) {
@@ -441,91 +643,92 @@ func popTextArguments(stk *Stack) []Value {
 func interpretTextUntil(strm Value, execute func(*Stack, string) error) error {
 	var stk Stack
 	var dicts []dict
-	streamCount := 1
+	var readers []io.Reader
+	var closers []io.Closer
 	if strm.Kind() == Array {
-		streamCount = strm.Len()
+		readers = make([]io.Reader, 0, strm.Len())
+		closers = make([]io.Closer, 0, strm.Len())
+		for i := 0; i < strm.Len(); i++ {
+			reader := strm.Index(i).Reader()
+			readers = append(readers, reader)
+			closers = append(closers, reader)
+		}
+	} else {
+		reader := strm.Reader()
+		readers = []io.Reader{reader}
+		closers = []io.Closer{reader}
 	}
-
-	for streamIndex := 0; streamIndex < streamCount; streamIndex++ {
-		contentStream := strm
-		if strm.Kind() == Array {
-			contentStream = strm.Index(streamIndex)
+	defer func() {
+		for _, closer := range closers {
+			_ = closer.Close()
 		}
-		reader := contentStream.Reader()
-		parser := newBuffer(reader, 0)
-		parser.allowEOF = true
-		parser.allowObjptr = false
-		parser.allowStream = false
+	}()
 
-	reading:
-		for {
-			tok := parser.readToken()
-			if tok == io.EOF {
-				break
-			}
-			if keywordToken, ok := tok.(keyword); ok {
-				switch keywordToken {
-				case "null", "[", "]", "<<", ">>":
-				case "dict":
-					stk.Pop()
-					stk.Push(newDict())
-					continue
-				case "currentdict":
-					if len(dicts) == 0 {
-						reader.Close()
-						return errors.New("no current dictionary")
-					}
-					stk.Push(Value{nil, objptr{}, dicts[len(dicts)-1]})
-					continue
-				case "begin":
-					dictionary := stk.Pop()
-					if dictionary.Kind() != Dict {
-						reader.Close()
-						return errors.New("cannot begin non-dictionary")
-					}
-					dicts = append(dicts, dictionary.data.(dict))
-					continue
-				case "end":
-					if len(dicts) == 0 {
-						reader.Close()
-						return errors.New("mismatched begin/end")
-					}
-					dicts = dicts[:len(dicts)-1]
-					continue
-				case "def":
-					if len(dicts) == 0 {
-						reader.Close()
-						return errors.New("def without open dictionary")
-					}
-					value := stk.Pop()
-					key, ok := stk.Pop().data.(name)
-					if ok {
-						dicts[len(dicts)-1][key] = value.data
-					}
-					continue
-				case "pop":
-					stk.Pop()
-					continue
-				default:
-					for i := len(dicts) - 1; i >= 0; i-- {
-						if value, ok := dicts[i][name(keywordToken)]; ok {
-							stk.Push(Value{nil, objptr{}, value})
-							continue reading
-						}
-					}
-					if err := execute(&stk, string(keywordToken)); err != nil {
-						reader.Close()
-						return err
-					}
-					continue
+	parser := newBuffer(io.MultiReader(readers...), 0)
+	parser.allowEOF = true
+	parser.allowObjptr = false
+	parser.allowStream = false
+
+reading:
+	for {
+		tok := parser.readToken()
+		if tok == io.EOF {
+			break
+		}
+		if keywordToken, ok := tok.(keyword); ok {
+			switch keywordToken {
+			case "null", "[", "]", "<<", ">>":
+			case "dict":
+				stk.Pop()
+				stk.Push(newDict())
+				continue
+			case "currentdict":
+				if len(dicts) == 0 {
+					return errors.New("no current dictionary")
 				}
+				stk.Push(Value{nil, objptr{}, dicts[len(dicts)-1]})
+				continue
+			case "begin":
+				dictionary := stk.Pop()
+				if dictionary.Kind() != Dict {
+					return errors.New("cannot begin non-dictionary")
+				}
+				dicts = append(dicts, dictionary.data.(dict))
+				continue
+			case "end":
+				if len(dicts) == 0 {
+					return errors.New("mismatched begin/end")
+				}
+				dicts = dicts[:len(dicts)-1]
+				continue
+			case "def":
+				if len(dicts) == 0 {
+					return errors.New("def without open dictionary")
+				}
+				value := stk.Pop()
+				key, ok := stk.Pop().data.(name)
+				if ok {
+					dicts[len(dicts)-1][key] = value.data
+				}
+				continue
+			case "pop":
+				stk.Pop()
+				continue
+			default:
+				for i := len(dicts) - 1; i >= 0; i-- {
+					if value, ok := dicts[i][name(keywordToken)]; ok {
+						stk.Push(Value{nil, objptr{}, value})
+						continue reading
+					}
+				}
+				if err := execute(&stk, string(keywordToken)); err != nil {
+					return err
+				}
+				continue
 			}
-			parser.unreadToken(tok)
-			stk.Push(Value{nil, objptr{}, parser.readObject()})
 		}
-		if err := reader.Close(); err != nil {
-			return err
-		}
+		parser.unreadToken(tok)
+		stk.Push(Value{nil, objptr{}, parser.readObject()})
 	}
 	return nil
 }

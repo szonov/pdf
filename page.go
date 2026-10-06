@@ -64,17 +64,14 @@ func (r *Reader) NumPage() int {
 func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	fonts := make(map[string]*Font)
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
-		for name, f := range p.fontCache() { // cache fonts so we don't continually parse charmap
-			if _, ok := fonts[name]; !ok {
-				fonts[name] = f
-			}
-		}
-		text, err := p.GetPlainText(fonts)
+		text, err := p.GetPlainText(nil)
 		if err != nil {
 			return nil, err
+		}
+		if buf.Len() > 0 && text != "" {
+			buf.WriteByte('\n')
 		}
 		buf.WriteString(text)
 	}
@@ -150,10 +147,14 @@ func (p Page) Font(name string) Font {
 // fontCache returns the page's fonts keyed by name, parsing each font only
 // once so that repeated text operations don't re-parse its charmap.
 func (p Page) fontCache() map[string]*Font {
+	return fontCacheForResources(p.Resources())
+}
+
+func fontCacheForResources(resources Value) map[string]*Font {
 	fonts := make(map[string]*Font)
-	for _, name := range p.Fonts() {
+	for _, name := range resources.Key("Font").Keys() {
 		if _, ok := fonts[name]; !ok {
-			f := p.Font(name)
+			f := Font{V: resources.Key("Font").Key(name)}
 			fonts[name] = &f
 		}
 	}
@@ -571,8 +572,8 @@ func decodeText(enc TextEncoding, raw string) string {
 	return b.String()
 }
 
-// GetPlainText returns the page's all text without format.
-// fonts can be passed in (to improve parsing performance) or left nil
+// GetPlainText returns all page text reconstructed in reading order.
+// The fonts argument is retained for API compatibility and may be nil.
 func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	defer recoverTo(&err, func() { result = "" })
 
@@ -580,68 +581,17 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
 		return "", nil
 	}
-	strm := p.V.Key("Contents")
-	var enc TextEncoding = &nopEncoder{}
-
-	if fonts == nil {
-		fonts = p.fontCache()
-	}
-
-	var textBuilder bytes.Buffer
-	showText := func(s string) {
-		textBuilder.WriteString(s)
-	}
-	showEncodedText := func(s string) {
-		textBuilder.WriteString(decodeText(enc, s))
-	}
-
-	Interpret(strm, func(stk *Stack, op string) {
-		args := popArgs(stk)
-
-		switch op {
-		default:
-			// Easier debug
-			// fmt.Println("<DEBUG><op>", op, "</op><args>", args, "</args>")
-			return
-		case "BT": // add a space between text objects
-			showText("\n")
-		case "T*": // move to start of next line
-			showEncodedText("\n")
-		case "Tf": // set text font and size
-			if len(args) != 2 {
-				panic("bad TL")
-			}
-			if font, ok := fonts[args[0].Name()]; ok {
-				enc = font.Encoder()
-			} else {
-				enc = &nopEncoder{}
-			}
-		case "\"": // set spacing, move to next line, and show text
-			if len(args) != 3 {
-				panic("bad \" operator")
-			}
-			fallthrough
-		case "'": // move to next line and show text
-			if len(args) != 1 {
-				panic("bad ' operator")
-			}
-			fallthrough
-		case "Tj": // show text
-			if len(args) != 1 {
-				panic("bad Tj operator")
-			}
-			showEncodedText(args[0].RawString())
-		case "TJ": // show text, allowing individual glyph positioning
-			v := args[0]
-			for i := 0; i < v.Len(); i++ {
-				x := v.Index(i)
-				if x.Kind() == String {
-					showEncodedText(x.RawString())
-				}
-			}
-		}
+	_ = fonts // Kept for API compatibility; WalkTextBlocks caches fonts per resource dictionary.
+	blocks := make([]TextBlock, 0, 64)
+	err = p.WalkTextBlocks(func(block TextBlock) error {
+		blocks = append(blocks, block)
+		return nil
 	})
-	return textBuilder.String(), nil
+	if err != nil {
+		return "", err
+	}
+	rotation := p.findInherited("Rotate").Int64()
+	return layoutTextBlocks(blocks, rotation), nil
 }
 
 // Column represents the contents of a column
