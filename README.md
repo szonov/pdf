@@ -24,6 +24,19 @@ The module requires Go 1.24.1 or newer.
 
 ## Reading plain text
 
+Use `Reader.WritePlainText` to process the document sequentially without
+retaining all extracted text in memory:
+
+```go
+if err := reader.WritePlainText(os.Stdout); err != nil {
+	log.Fatal(err)
+}
+```
+
+`Reader.GetPlainText` remains available when an `io.Reader` is required. It
+uses the same one-pass page traversal internally but buffers the complete
+result before returning.
+
 ```go
 package main
 

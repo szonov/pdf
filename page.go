@@ -60,20 +60,52 @@ func (r *Reader) NumPage() int {
 	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
 }
 
-// GetPlainText returns all the text in the PDF file
-func (r *Reader) GetPlainText() (reader io.Reader, err error) {
-	pages := r.NumPage()
-	var buf bytes.Buffer
-	for i := 1; i <= pages; i++ {
-		p := r.Page(i)
-		text, err := p.GetPlainText(nil)
+// WritePlainText reconstructs every page's text in document order and writes
+// it to w without retaining the whole document's text in memory. Non-empty
+// pages are separated by a newline.
+func (r *Reader) WritePlainText(w io.Writer) error {
+	if w == nil {
+		return errors.New("nil plain text writer")
+	}
+	wroteText := false
+	return r.WalkPages(func(_ int, page Page) error {
+		text, err := page.GetPlainText(nil)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if buf.Len() > 0 && text != "" {
-			buf.WriteByte('\n')
+		if text == "" {
+			return nil
 		}
-		buf.WriteString(text)
+		if wroteText {
+			if err := writePlainTextString(w, "\n"); err != nil {
+				return err
+			}
+		}
+		if err := writePlainTextString(w, text); err != nil {
+			return err
+		}
+		wroteText = true
+		return nil
+	})
+}
+
+func writePlainTextString(w io.Writer, text string) error {
+	written, err := io.WriteString(w, text)
+	if err != nil {
+		return err
+	}
+	if written != len(text) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+// GetPlainText returns all the text in the PDF file. Use WritePlainText when
+// the text can be consumed incrementally without buffering the whole document.
+func (r *Reader) GetPlainText() (io.Reader, error) {
+	var buf bytes.Buffer
+	if err := r.WritePlainText(&buf); err != nil {
+		return nil, err
 	}
 	return &buf, nil
 }
