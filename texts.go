@@ -82,8 +82,8 @@ func walkTextContent(
 			fontName := args[0].Name()
 			encoding, ok := fonts[fontName]
 			if !ok {
-				font := Font{V: resources.Key("Font").Key(fontName)}
-				encoding = font.Encoder()
+				font := resources.Key("Font").Key(fontName)
+				encoding = cachedFontEncoding(font)
 				fonts[fontName] = encoding
 			}
 			state.encoding = encoding
@@ -139,4 +139,24 @@ func walkTextContent(
 		}
 		return nil
 	})
+}
+
+func cachedFontEncoding(value Value) TextEncoding {
+	if value.r == nil || value.ptr.id == 0 {
+		return (&Font{V: value}).Encoder()
+	}
+	value.r.fontMu.RLock()
+	encoding, found := value.r.fontEncodings[value.ptr]
+	value.r.fontMu.RUnlock()
+	if found {
+		return encoding
+	}
+	value.r.fontMu.Lock()
+	defer value.r.fontMu.Unlock()
+	if cached, found := value.r.fontEncodings[value.ptr]; found {
+		return cached
+	}
+	encoding = (&Font{V: value}).Encoder()
+	value.r.fontEncodings[value.ptr] = encoding
+	return encoding
 }

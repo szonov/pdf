@@ -131,7 +131,16 @@ func (p Page) CropBox() Value {
 
 // Resources returns the resources dictionary associated with the page.
 func (p Page) Resources() Value {
-	return p.findInherited("Resources")
+	for v := p.V; !v.IsNull(); v = v.Key("Parent") {
+		dictionary, ok := v.data.(dict)
+		if !ok {
+			continue
+		}
+		if resources, ok := dictionary[name("Resources")]; ok {
+			return v.r.resolveResource(v.ptr, resources)
+		}
+	}
+	return Value{}
 }
 
 // Fonts returns a list of the fonts associated with the page.

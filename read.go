@@ -72,6 +72,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
@@ -79,13 +80,17 @@ var DebugOn = false
 
 // A Reader is a single PDF file open for reading.
 type Reader struct {
-	f          io.ReaderAt
-	end        int64
-	xref       []xref
-	trailer    dict
-	trailerptr objptr
-	key        []byte
-	useAES     bool
+	f             io.ReaderAt
+	end           int64
+	xref          []xref
+	trailer       dict
+	trailerptr    objptr
+	key           []byte
+	useAES        bool
+	resourceMu    sync.RWMutex
+	resourceCache map[objptr]object
+	fontMu        sync.RWMutex
+	fontEncodings map[objptr]TextEncoding
 }
 
 type xref struct {
@@ -158,8 +163,10 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 
 	r = &Reader{
-		f:   f,
-		end: end,
+		f:             f,
+		end:           end,
+		resourceCache: make(map[objptr]object),
+		fontEncodings: make(map[objptr]TextEncoding),
 	}
 	pos := end - endChunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
@@ -809,6 +816,30 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
+}
+
+func (r *Reader) resolveResource(parent objptr, x object) Value {
+	ptr, indirect := x.(objptr)
+	if !indirect {
+		return r.resolve(parent, x)
+	}
+	r.resourceMu.RLock()
+	cached, found := r.resourceCache[ptr]
+	r.resourceMu.RUnlock()
+	if found {
+		return Value{r, ptr, cached}
+	}
+	r.resourceMu.Lock()
+	defer r.resourceMu.Unlock()
+	if cached, found := r.resourceCache[ptr]; found {
+		return Value{r, ptr, cached}
+	}
+	v := r.resolve(parent, ptr)
+	if v.IsNull() {
+		return v
+	}
+	r.resourceCache[ptr] = v.data
+	return v
 }
 
 type errorReadCloser struct {
