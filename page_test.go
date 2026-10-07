@@ -6,6 +6,42 @@ import (
 	"testing"
 )
 
+func TestPageFindsPagesFromEitherEndOfNestedTree(t *testing.T) {
+	page := func(marker int64) dict {
+		return dict{name("Type"): name("Page"), name("Marker"): marker}
+	}
+	left := dict{
+		name("Type"):  name("Pages"),
+		name("Count"): int64(2),
+		name("Kids"):  array{page(1), page(2)},
+	}
+	right := dict{
+		name("Type"):  name("Pages"),
+		name("Count"): int64(2),
+		name("Kids"):  array{page(3), page(4)},
+	}
+	rootPages := dict{
+		name("Type"):  name("Pages"),
+		name("Count"): int64(5),
+		name("Kids"):  array{left, right, page(5)},
+	}
+	reader := &Reader{trailer: dict{
+		name("Root"): dict{name("Pages"): rootPages},
+	}}
+
+	for number := 1; number <= 5; number++ {
+		got := reader.Page(number).V.Key("Marker").Int64()
+		if got != int64(number) {
+			t.Fatalf("Page(%d) marker = %d, want %d", number, got, number)
+		}
+	}
+	for _, number := range []int{-1, 0, 6} {
+		if page := reader.Page(number); !page.V.IsNull() {
+			t.Fatalf("Page(%d) = %v, want null", number, page.V)
+		}
+	}
+}
+
 func TestUcs2Encoder(t *testing.T) {
 	// raw content in PDF (hexed for pretty)
 	// 6c5f82cf94f6884c005c284ea4661362636b3e56de5355005c29

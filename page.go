@@ -23,36 +23,80 @@ type Page struct {
 // Page numbers are indexed starting at 1, not 0.
 // If the page is not found, Page returns a Page with p.V.IsNull().
 func (r *Reader) Page(num int) Page {
-	num-- // now 0-indexed
 	page := r.Trailer().Key("Root").Key("Pages")
+	count := int(page.Key("Count").Int64())
+	index := num - 1
+	if index < 0 || index >= count {
+		return Page{}
+	}
+	return pageAtIndex(page, index)
+}
+
+func pageAtIndex(page Value, index int) Page {
 Search:
 	for page.Key("Type").Name() == "Pages" {
 		count := int(page.Key("Count").Int64())
-		if count < num {
+		if index < 0 || index >= count {
 			return Page{}
 		}
 		kids := page.Key("Kids")
-		for i := 0; i < kids.Len(); i++ {
-			kid := kids.Index(i)
-			if kid.Key("Type").Name() == "Pages" {
-				c := int(kid.Key("Count").Int64())
-				if num < c {
-					page = kid
-					continue Search
+		if index <= count-1-index {
+			for i := 0; i < kids.Len(); i++ {
+				kid := kids.Index(i)
+				kidCount := pageTreeKidCount(kid)
+				if kidCount == 0 {
+					continue
 				}
-				num -= c
+				if index >= kidCount {
+					index -= kidCount
+					continue
+				}
+				if kid.Key("Type").Name() == "Page" {
+					return Page{kid}
+				}
+				page = kid
+				continue Search
+			}
+			break
+		}
+
+		fromEnd := count - 1 - index
+		for i := kids.Len() - 1; i >= 0; i-- {
+			kid := kids.Index(i)
+			kidCount := pageTreeKidCount(kid)
+			if kidCount == 0 {
+				continue
+			}
+			if fromEnd >= kidCount {
+				fromEnd -= kidCount
 				continue
 			}
 			if kid.Key("Type").Name() == "Page" {
-				if num == 0 {
+				if fromEnd == 0 {
 					return Page{kid}
 				}
-				num--
+				break
 			}
+			index = kidCount - 1 - fromEnd
+			page = kid
+			continue Search
 		}
 		break
 	}
 	return Page{}
+}
+
+func pageTreeKidCount(kid Value) int {
+	switch kid.Key("Type").Name() {
+	case "Page":
+		return 1
+	case "Pages":
+		count := int(kid.Key("Count").Int64())
+		if count > 0 {
+			return count
+		}
+	}
+	return 0
 }
 
 // NumPage returns the number of pages in the PDF file.
