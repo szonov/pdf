@@ -90,6 +90,27 @@ if err != nil && !errors.Is(err, pdf.ErrStopWalking) {
 Unlike repeatedly calling `Reader.Page`, this method traverses the PDF page
 tree once and can stop before later pages are resolved.
 
+## Writing selected pages
+
+`Reader.WritePages` writes selected pages to a new PDF without decoding and
+re-encoding their content streams. Page numbers start at 1 and are written in
+the order supplied. Shared resources are copied only once.
+
+```go
+output, err := os.Create("selected-pages.pdf")
+if err != nil {
+	log.Fatal(err)
+}
+defer output.Close()
+
+if err := reader.WritePages(output, []int{19, 20}); err != nil {
+	log.Fatal(err)
+}
+```
+
+The source must not be encrypted. Document-level features such as outlines,
+page labels, forms, and metadata are not copied to the resulting PDF.
+
 ## Walking text
 
 `Page.WalkTexts` emits decoded strings from PDF text-showing operators in
